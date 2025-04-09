@@ -1,78 +1,75 @@
-# TISM V1 TOTALLY INSANE SIMULATED MACHINES
+# TISM V4 – Totally Insane Synthetic Machines
 
-Yo, welcome to **TISM** – a no-BS, rapid-deployment Telegram bot and web API that lets you chat with AI models like a boss. This project is all about bootstrapping, keeping things real, and using weighted model selection to deliver smart (and sometimes hilarious) replies. If you're all about getting sh*t done without over-engineering, you're in the right place.
+Welcome to **TISM V4** – the next evolution of our Telegram bot framework for insane synthetic roleplaying powered by vllms. This version is leaner, meaner, and packed with modular design, robust error handling, and killer metrics. It's built to help you bootstrap your AI-powered Telegram bots faster than you can say "Nomad List"!
+
+---
+
+## Overview
+
+TISM V4 is designed for:
+- **Roleplaying and Chatbots:** Create wild, unpredictable conversations with AI.
+- **Per-Chat Customization:** Set different personalities, models, and even TTS voices per chat.
+- **Resilience & Observability:** Built-in error handling, exponential backoff, and Prometheus metrics keep your bot robust and production-ready.
+- **FastAPI Integration:** Monitor your bot via an HTTP API with endpoints for status, models, config reloads, and metrics.
 
 ---
 
 ## Features
 
-- **Multi-Bot Setup:** Run multiple Telegram bot instances with unique tokens, system prompts, and personalities.
-- **Weighted Model Selection:** Dynamically picks AI models based on performance weights.
-- **Conversation History:** Maintains context for your chats (last 5 messages per chat) to keep the conversation flow.
-- **Text-to-Speech (TTS):** Converts bot replies to voice messages using a TTS API.
-- **Hot Config Reload:** Change non-bot settings on the fly with a simple API call.
-- **FastAPI Server:** Provides endpoints for stats, model listing, and config reloading.
-- **Robust Error Handling:** Retries model requests with exponential backoff in case of failure.
-- **Monkey Patching Telegram:** Removes unwanted proxy settings from Telegram's HTTPX request for smoother operations.
+- **Multi-Bot Support:** Run multiple Telegram bot instances simultaneously.
+- **Custom Configurations:** Easily adjust system prompts, model selections, and TTS settings via `config.ini`.
+- **Dynamic Model Management:** Auto-fetches models from your vllm endpoints with weighted selection and retries.
+- **Text-to-Speech (TTS):** Converts text responses to voice messages with multiple voice options.
+- **Prometheus Metrics:** Expose real-time metrics for monitoring and observability.
+- **FastAPI Server:** Lightweight web server to interact with your bot and view stats.
 
 ---
 
-## Quick Start
+## Installation
 
-### Prerequisites
+### Requirements
 
-- **Python 3.9+**
-- [Telegram Bot API Token(s)](https://core.telegram.org/bots#6-botfather)
-- [VLLM Endpoints](https://openai.com) (or your preferred AI service endpoints)
-- [TTS API Key](#configuration) for text-to-speech functionality
+Make sure you have the following Python libraries installed:
 
-### Installation
+```txt
+openai
+python-telegram-bot>=20.0
+fastapi
+uvicorn
+prometheus_client
+```
 
-1. **Clone the Repo**
+You can install them using pip:
 
-   ```bash
-   git clone https://gitlab.com/DisruptiveCollective/tism.git
-   cd tism
-   ```
+```bash
+pip install openai python-telegram-bot>=20.0 fastapi uvicorn prometheus_client
+```
 
-2. **Create a Virtual Environment & Install Dependencies**
+### Clone the Repo
 
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows use: venv\Scripts\activate
-   pip install -r requirements.txt
-   ```
+```bash
+git clone https://github.com/DisruptiveCollective/tism.git
+cd tism
+```
 
-3. **Configure Your Environment**
+### Configuration
 
-   Create a `config.ini` file in the root directory. Check out the [Configuration](#configuration) section below.
-
-4. **Run the Bot & API Server**
-
-   ```bash
-   python main.py
-   ```
-
----
-
-## Configuration
-
-Edit `config.ini` to set up your bots, models, and TTS settings. Here's a sample configuration:
+Create a `config.ini` file in the project root. Here's a sample configuration:
 
 ```ini
 [bots]
 telegram_tokens = YOUR_TELEGRAM_TOKEN_1, YOUR_TELEGRAM_TOKEN_2
-system_prompts = "You are a helpful assistant.", "You are a witty conversationalist."
-bot_usernames = your_bot_username1, your_bot_username2
+system_prompts = "Welcome to TISM!", "Hello from TISM!"
+bot_usernames = tismbot1, tismbot2
 
 [vllm_endpoints]
-endpoints = https://api.vllm1.example.com, https://api.vllm2.example.com
+endpoints = https://vllm.endpoint1.com, https://vllm.endpoint2.com
 
 [settings]
-system_prompt = "Default system prompt here."
+system_prompt = "Default system prompt for TISM"
 reply_chance = 0.1
 max_tokens = 200
-blacklist_models = some-bad-model
+blacklist_models = modelA, modelB
 max_model_retries = 3
 retry_delay = 10
 
@@ -82,93 +79,71 @@ endpoint = https://api.tts.example.com/synthesize
 model = tts-1
 voice = echo
 speed = 0.9
+available_voices = echo,default
 ```
 
-*Notes:*
-- **Token Lists:** Make sure the number of tokens, prompts, and usernames match.
-- **Model Weights:** These get adjusted dynamically based on performance.
+---
+
+## Usage
+
+### Running the Bot
+
+Simply run the main script:
+
+```bash
+python main.py
+```
+
+This will start:
+- Your Telegram bot(s) (via the latest python-telegram-bot v20+).
+- A FastAPI server on port 8007 with endpoints for info, stats, config reload, and Prometheus metrics.
+
+### FastAPI Endpoints
+
+- **GET /**: Basic info about TISM V4.
+- **GET /models**: List of available models.
+- **GET /stats**: Bot usage stats.
+- **POST /reload_config**: Reload configuration from `config.ini`.
+- **GET /metrics**: Prometheus metrics endpoint.
 
 ---
 
-## Telegram Bot Commands
+## Commands (Telegram)
 
-- **/start**  
-  Kick things off with a fun welcome message.
-
-- **/help**  
-  List all available commands and their usage.
-
-- **/models**  
-  Get a rundown of registered AI models and their endpoints.
-
-- **/credits**  
-  See who made the magic happen (spoiler: it's us, and we own your soul now 😜).
-
-- **/stats**  
-  Check the current usage stats (messages processed, errors, etc.).
-
-- **/setpersonality \<text\>**  
-  Override the default system prompt for your chat with a custom personality.
-
-- **/clearpersonality**  
-  Revert to the default system prompt by clearing the custom one.
-
----
-
-## API Endpoints
-
-The FastAPI server runs on port **8007** by default.
-
-- **GET /**  
-  Returns a basic welcome message.
-
-- **GET /models**  
-  Lists all available AI models with their endpoints.
-
-- **GET /stats**  
-  Returns usage statistics (e.g., messages processed, errors).
-
-- **POST /reload_config**  
-  Hot-reloads non-bot configuration settings from `config.ini`.
-
----
-
-## How It Works
-
-1. **Startup:**  
-   - The script reads from `config.ini`, loads Telegram bot tokens, system prompts, and endpoints.
-   - It fetches available AI models from the provided endpoints, applying a blacklist if necessary.
-
-2. **Handling Messages:**  
-   - Incoming Telegram messages are processed.
-   - Uses weighted model selection to choose an AI model for generating replies.
-   - Maintains a short conversation history for context.
-   - Replies are sent both as text (split into chunks if too long) and voice messages using TTS.
-
-3. **Error Handling & Retries:**  
-   - If a model fails, the bot will retry with different models using exponential backoff.
-   - Adjusts model weights based on performance to favor the best responders.
-
-4. **API & Hot Reloading:**  
-   - FastAPI serves endpoints for stats, models, and config reload.
-   - This allows real-time monitoring and adjustments without restarting the bots.
+- `/start` – Start the bot.
+- `/help` – Display this help message.
+- `/models` – List available models.
+- `/setmodel <number>` – Select a model for the current chat.
+- `/credits` – Show credits.
+- `/stats` – Display bot usage statistics.
+- `/setpersonality <text>` – Change the personality for the chat.
+- `/clearpersonality` – Clear custom personality and revert to default.
+- `/tts_on` – Enable text-to-speech responses.
+- `/tts_off` – Disable text-to-speech responses.
+- `/listvoices` – List available TTS voices.
+- `/setvoice <number>` – Select a TTS voice for this chat.
 
 ---
 
 ## Contributing
 
-Got ideas to make TISM even more badass? Fork the repo, make your changes, and submit a merge request. We value practical, no-fluff contributions that solve real problems.
+Got ideas? Found a bug? Feel free to submit a pull request or open an issue on GitHub. We love community input—it's what keeps TISM wild and ever-evolving.
 
 ---
 
 ## License
 
-Distributed under the MIT License. See the [LICENSE](LICENSE) file for details.
+TISM V4 is released under the MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
 ## Final Words
 
-TISM is built for the disruptors, the digital nomads, and anyone tired of overcomplicated shit. Get it up and running, tweak it, and make it your own. Remember, action beats perfection any day. Now go out there and disrupt the status quo, one bot message at a time!
+TISM V4 is all about rapid iteration and real-world problem solving. Get it up, tweak it, and make it your own. Whether you're building a quirky chat assistant or an AI roleplaying legend, this bot framework is your launchpad to disruption.
 
-Peace out, and happy hacking.
+Happy hacking, and remember: keep it insane, keep it synthetic!  
+— Pieter (if he were here, he'd say, "Just ship it.")
+
+---
+
+*Enjoy TISM V4 – where your wildest bot ideas come to life!*
