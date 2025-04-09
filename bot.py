@@ -1,24 +1,20 @@
+"""
+TISM v2 – Totally Insane Synthetic Machines
+
+A Telegram bot framework that uses vllms for roleplaying, with per-chat model and personality settings, TTS support, and a FastAPI server with enhanced metrics and logging.
+"""
+
 import configparser
 import logging
 import random
 import re
 import asyncio
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 from io import BytesIO
 import tempfile
 import os
 
 import openai
-from telegram.request import _httpxrequest
-
-# Monkey patch: Remove 'proxies' from telegram's HTTPXRequest kwargs
-original_build_client = _httpxrequest.HTTPXRequest._build_client
-def patched_build_client(self):
-    self._client_kwargs.pop("proxies", None)
-    return original_build_client(self)
-_httpxrequest.HTTPXRequest._build_client = patched_build_client
-# End monkey patch
-
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -27,29 +23,47 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 import uvicorn
 
-# Configure logging
+# Prometheus for metrics
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+
+# ----------------------
+# Configuration & Logging
+# ----------------------
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Global statistics and conversation history
+def load_config(config_file: str = "config.ini") -> configparser.ConfigParser:
+    """Load and parse the configuration file."""
+    cfg = configparser.ConfigParser()
+    cfg.read(config_file)
+    return cfg
+
+def clean_config_value(value: str) -> str:
+    """Clean a config value by stripping comments and whitespace."""
+    return value.split(";", 1)[0].strip()
+
+config = load_config()
+
+# ----------------------
+# Global State & Metrics
+# ----------------------
 stats: Dict[str, int] = {"messages_processed": 0, "errors": 0}
 conversation_history: Dict[Tuple[str, int], List[str]] = {}
 model_weights: Dict[str, float] = {}
 
-# Load and clean config
-config = configparser.ConfigParser()
-config.read("config.ini")
+# Prometheus metrics
+MESSAGES_PROCESSED = Counter('tism_messages_processed', 'Total messages processed')
+ERROR_COUNTER = Counter('tism_errors_total', 'Total errors encountered')
+MODEL_SELECTION_LATENCY = Histogram('tism_model_selection_seconds', 'Latency for model selection and response')
 
-def clean_config_value(value: str) -> str:
-    """Clean configuration value by splitting at semicolon and stripping extra text."""
-    return value.split(";", 1)[0].strip()
-
-# Multiple bot tokens, system prompts, and bot usernames (comma-separated lists)
+# ----------------------
+# Bot Settings from Config
+# ----------------------
 BOT_TOKENS: List[str] = [
     clean_config_value(token)
     for token in config.get("bots", "telegram_tokens").split(",")
@@ -70,7 +84,6 @@ if not (len(BOT_TOKENS) == len(SYSTEM_PROMPTS) == len(BOT_USERNAMES)):
     logger.critical("The number of telegram_tokens, system_prompts, and bot_usernames must match.")
     exit(1)
 
-# Other settings remain global
 VLLM_ENDPOINTS: List[str] = [
     endpoint.strip()
     for endpoint in config.get("vllm_endpoints", "endpoints").split(",")
@@ -94,324 +107,792 @@ TTS_ENDPOINT: str = clean_config_value(config.get("tts", "endpoint", fallback="h
 TTS_MODEL: str = clean_config_value(config.get("tts", "model", fallback="tts-1"))
 TTS_VOICE: str = clean_config_value(config.get("tts", "voice", fallback="echo"))
 TTS_SPEED: float = float(clean_config_value(config.get("tts", "speed", fallback="0.9")))
+AVAILABLE_VOICES: List[str] = [
+    v.strip() for v in config.get("tts", "available_voices", fallback="echo,default").split(",") if v.strip()
+]
 
-# Model management
+# Mapping from model ID to OpenAI client instance
 MODEL_CLIENT_MAP: Dict[str, Any] = {}
 
+# ----------------------
+# Monkey Patch Telegram HTTPX Client
+# ----------------------
+# Remove 'proxies' from telegram's HTTPXRequest kwargs (quick hack to bypass network issues)
+from telegram.request import _httpxrequest
+original_build_client = _httpxrequest.HTTPXRequest._build_client
+def patched_build_client(self):
+    self._client_kwargs.pop("proxies", None)
+    return original_build_client(self)
+_httpxrequest.HTTPXRequest._build_client = patched_build_client
+
+# ----------------------
+# Model Management
+# ----------------------
 def fetch_models() -> List[Dict[str, str]]:
-    """Fetch available models from the provided VLLM endpoints and initialize weights."""
-    models: List[Dict[str, str]] = []
+    """
+    Query all VLLM endpoints for available models, register non-blacklisted ones,
+    and set an initial weight.
+    Clears existing MODEL_CLIENT_MAP and model_weights before fetching.
+    """
+    global MODEL_CLIENT_MAP, model_weights # Ensure we modify the globals
+    MODEL_CLIENT_MAP.clear()
+    model_weights.clear()
+
+    fetched_models: List[Dict[str, str]] = []
+    logger.info("Starting model fetch from endpoints...")
     for endpoint in VLLM_ENDPOINTS:
         try:
-            client = openai.OpenAI(base_url=endpoint, api_key="not-needed")
+            client = openai.OpenAI(base_url=endpoint, api_key="not-needed") # Assuming API key isn't needed based on config
             resp = client.models.list()
             for m in resp.data:
                 model_id = m.id
-                if model_id and (model_id not in MODEL_CLIENT_MAP) and (model_id not in BLACKLISTED_MODELS):
-                    MODEL_CLIENT_MAP[model_id] = client
-                    models.append({"id": model_id, "endpoint": endpoint})
-                    model_weights[model_id] = 1.0
-                    logger.info(f"[✅] Registered model '{model_id}' from {endpoint}")
+                if model_id and (model_id not in BLACKLISTED_MODELS):
+                    # Only add if not already added from another endpoint (first one wins)
+                    if model_id not in MODEL_CLIENT_MAP:
+                        MODEL_CLIENT_MAP[model_id] = client
+                        fetched_models.append({"id": model_id, "endpoint": endpoint})
+                        model_weights[model_id] = 1.0 # Reset weight on fetch
+                        logger.info(f"[✅] Registered model '{model_id}' from {endpoint}")
+                    else:
+                         logger.info(f"[ℹ️] Model '{model_id}' already registered from another endpoint, skipping duplicate from {endpoint}")
                 elif model_id in BLACKLISTED_MODELS:
                     logger.info(f"[🚫] Skipped blacklisted model '{model_id}' from {endpoint}")
         except Exception as e:
-            logger.error(f"[⚠️] Error with endpoint {endpoint}: {e}")
-    return models
+            logger.error(f"[⚠️] Error fetching models from endpoint {endpoint}: {e}")
 
+    if not fetched_models:
+        logger.warning("[⚠️] No models were successfully fetched from any endpoint.")
+    else:
+        logger.info(f"Finished model fetch. Registered {len(fetched_models)} models.")
+
+    return fetched_models
+
+# Initial fetch on startup
 models = fetch_models()
 if not models:
-    logger.critical("[🔥] No models loaded. Shutting down.")
+    logger.critical("[🔥] No models loaded during initial startup. Check VLLM endpoints and configuration. Shutting down.")
+    # In a real scenario, you might want more robust handling than exiting,
+    # maybe retry or run in a degraded state if possible.
     exit(1)
 
-def weighted_model_selection(available_models: List[Dict[str, str]]) -> Dict[str, str]:
-    """Select a model using weighted random selection based on model_weights."""
-    total_weight = sum(model_weights.get(m["id"], 1.0) for m in available_models)
+def weighted_model_selection(available_models: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """Select a model based on weighted probabilities."""
+    # Filter models to ensure they still exist in our global map (in case of reload)
+    valid_models = [m for m in available_models if m["id"] in model_weights]
+    if not valid_models:
+        return None # No valid models available
+
+    total_weight = sum(model_weights[m["id"]] for m in valid_models)
+    if total_weight <= 0: # Avoid division by zero if all weights somehow became zero
+         return random.choice(valid_models) if valid_models else None
+
     rnd = random.uniform(0, total_weight)
     upto = 0
-    for m in available_models:
-        weight = model_weights.get(m["id"], 1.0)
+    for m in valid_models:
+        weight = model_weights[m["id"]]
         if upto + weight >= rnd:
             return m
         upto += weight
-    return random.choice(available_models)
+    # Fallback in case of floating point inaccuracies, return the last valid model
+    return valid_models[-1] if valid_models else None
 
-# Telegram Utilities
+# ----------------------
+# Telegram Utilities & Command Handlers
+# ----------------------
 async def send_long_message(update: Update, text: str) -> None:
-    """Send a long message in chunks if needed."""
+    """Send a long text message by chunking if needed."""
+    if not update.message: return # Should not happen with command/message handlers
     for i in range(0, len(text), MAX_MESSAGE_LENGTH):
+        chunk = text[i: i + MAX_MESSAGE_LENGTH]
         await update.message.reply_text(
-            text[i: i + MAX_MESSAGE_LENGTH],
+            chunk,
             reply_to_message_id=update.message.message_id,
         )
+        # Slight delay between chunks can prevent rate limiting issues
+        await asyncio.sleep(0.2)
 
 def extract_final_reply(response: str) -> str:
-    """
-    Extract the final reply from the model's response.
-    Removes HTML tags and extracts text after defined markers.
-    """
+    """Clean and extract the final answer from the model's response."""
+    # More robust cleaning - remove potential XML/HTML tags first
     cleaned_response = re.sub(r"<.*?>", "", response, flags=re.DOTALL | re.IGNORECASE)
-    markers = ["final answer:", "answer:", "assistant:", "conclusion:"]
-    for marker in markers:
-        pattern = re.compile(re.escape(marker), re.IGNORECASE)
-        match = pattern.search(cleaned_response)
-        if match:
-            return cleaned_response[match.end():].strip()
-    return cleaned_response.strip()
 
-# TTS Functions
-async def text_to_speech(text: str) -> BytesIO:
-    """
-    Convert text to speech using the TTS endpoint.
-    Streams audio to a temporary file then loads it into a BytesIO.
-    """
-    def sync_tts():
+    # Define markers indicating the start of the actual reply
+    # Adding common instruction-following markers
+    markers = ["final answer:", "answer:", "assistant:", "conclusion:", "response:", "reply:"]
+    lower_cleaned = cleaned_response.lower()
+
+    # Find the latest occurrence of any marker
+    best_pos = -1
+    for marker in markers:
+        pos = lower_cleaned.rfind(marker) # Use rfind to get the last occurrence
+        if pos > best_pos:
+            best_pos = pos + len(marker)
+
+    if best_pos != -1:
+        # Take the text after the last found marker
+        return cleaned_response[best_pos:].strip()
+    else:
+        # If no marker found, return the whole cleaned response
+        return cleaned_response.strip()
+
+async def send_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Convert text to speech and send as a voice message."""
+    if not update.message: return
+    try:
+        chat_id = update.effective_chat.id
+        # Use chat-specific voice if set, otherwise default
+        voice = context.bot_data.get("chat_voice", {}).get(chat_id, TTS_VOICE)
         tts_client = openai.OpenAI(api_key=TTS_API_KEY, base_url=TTS_ENDPOINT)
-        audio_buffer = BytesIO()
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+
+        # Use a temporary file for streaming TTS response - safer for potentially large audio
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
             temp_filename = tmp.name
+
         try:
+            # Stream the audio response directly to the temporary file
             with tts_client.audio.speech.with_streaming_response.create(
                 model=TTS_MODEL,
-                voice=TTS_VOICE,
+                voice=voice,
                 speed=TTS_SPEED,
-                input=text
+                input=text,
+                response_format="mp3" # Explicitly request mp3
             ) as response:
                 response.stream_to_file(temp_filename)
-            with open(temp_filename, "rb") as f:
-                audio_buffer.write(f.read())
-        finally:
-            os.remove(temp_filename)
-        audio_buffer.seek(0)
-        return audio_buffer
-    return await asyncio.to_thread(sync_tts)
 
-async def send_voice_message(update: Update, text: str) -> None:
-    """Generate and send a voice note from text."""
-    try:
-        audio_file = await text_to_speech(text)
-        await update.message.reply_voice(voice=audio_file, caption="Voice reply:")
+            # Send the saved file as a voice message
+            await update.message.reply_voice(voice=open(temp_filename, "rb"), caption="Voice reply:")
+
+        finally:
+            # Ensure the temporary file is removed after sending or if an error occurs
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+
     except Exception as e:
-        logger.error(f"[TTS Error] Could not send voice note: {e}")
+        logger.error(f"[TTS Error] Could not generate or send voice note for chat {update.effective_chat.id}: {e}", exc_info=True)
+        # Optionally inform the user
+        # await update.message.reply_text("Sorry, I couldn't generate the voice reply.")
+
 
 # Command Handlers
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command."""
-    await update.message.reply_text("lmao u found me, glowies r watching, /credits 4 more")
+    if not update.message: return
+    await update.message.reply_text("Hey there! Welcome to TISM. Try /help for commands.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /help command."""
+    if not update.message: return
+    # Updated help text including new commands
     help_text = (
         "Available commands:\n"
         "/start - Start the bot\n"
         "/help - Show this help message\n"
         "/models - List available models\n"
+        "/setmodel <number> - Select model for this chat\n"
+        "/unsetmodel - Clear chat-specific model setting\n" # New command
+        "/reload_models - Refresh the list of available models\n" # New command
         "/credits - Show credits\n"
         "/stats - Show bot usage stats\n"
-        "/setpersonality <text> - Change the personality for this chat\n"
-        "/clearpersonality - Clear custom personality and revert to default"
+        "/setpersonality <text> - Change personality for this chat\n"
+        "/clearpersonality - Clear custom personality\n"
+        "/tts_on - Enable text-to-speech responses\n"
+        "/tts_off - Disable text-to-speech responses\n"
+        "/listvoices - List available TTS voices\n"
+        "/setvoice <number> - Select TTS voice for this chat"
     )
     await update.message.reply_text(help_text)
 
 async def list_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List registered models."""
+    if not update.message: return
+    if not models:
+         await update.message.reply_text("No models are currently loaded. Try /reload_models or check the logs.")
+         return
+    # Use the global 'models' list which is updated by fetch_models
     msg = "\n".join(
-        f"{i+1}. {m['id']} @ {re.sub(r'https?://', '[REDACTED]/', m['endpoint'])}"
+        # Safely access endpoint info, guarding against potential inconsistencies
+        f"{i+1}. {m.get('id', 'Unknown ID')} @ {re.sub(r'https?://', '[REDACTED]/', m.get('endpoint', 'Unknown Endpoint'))}"
         for i, m in enumerate(models)
     )
-    await send_long_message(update, f"brainz online:\n{msg}")
+    await send_long_message(update, f"Available models:\n{msg}")
+
+async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message: return
+    if not context.args:
+        await update.message.reply_text("Usage: /setmodel <model_number>\nUse /models to see the list.")
+        return
+    if not models:
+         await update.message.reply_text("No models are currently loaded. Cannot set a model.")
+         return
+    try:
+        index = int(context.args[0]) - 1
+        if index < 0 or index >= len(models):
+            await update.message.reply_text(f"Invalid model number. Please choose between 1 and {len(models)}.")
+            return
+
+        selected_model = models[index]
+        model_id = selected_model.get('id')
+        if not model_id:
+            await update.message.reply_text("Error: Selected model data is incomplete. Cannot set model.")
+            logger.error(f"Incomplete model data at index {index}: {selected_model}")
+            return
+
+        # Store the selected model ID for the chat
+        context.bot_data.setdefault("chat_model", {})[update.effective_chat.id] = model_id
+        await update.message.reply_text(f"Model for this chat set to: {model_id}")
+        logger.info(f"Chat {update.effective_chat.id} set to use model '{model_id}'")
+
+    except (ValueError, IndexError):
+        await update.message.reply_text("Invalid input. Please provide a valid model number from the /models list.")
+
+# New command handler for /unsetmodel
+async def unset_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clears the chat-specific model setting."""
+    if not update.message: return
+    chat_id = update.effective_chat.id
+    chat_models = context.bot_data.setdefault("chat_model", {})
+
+    if chat_id in chat_models:
+        del chat_models[chat_id]
+        await update.message.reply_text("Chat-specific model setting cleared. Now using default model selection.")
+        logger.info(f"Cleared model preference for chat {chat_id}")
+    else:
+        await update.message.reply_text("No chat-specific model was set. Using default selection.")
+
+# New command handler for /reload_models
+async def reload_models_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Forces a refresh of the available models from endpoints."""
+    global models # Declare intent to modify the global models list
+    if not update.message: return
+
+    await update.message.reply_text("🔄 Refreshing model list from backend endpoints...")
+    logger.info(f"Manual model reload triggered by user {update.effective_user.id} in chat {update.effective_chat.id}")
+
+    try:
+        # fetch_models now handles clearing maps and fetching new models
+        new_models = fetch_models()
+        models = new_models # Update the global list
+
+        if models:
+            await update.message.reply_text(f"✅ Model list refreshed successfully. Found {len(models)} models.")
+            logger.info(f"Manual model reload complete. {len(models)} models loaded.")
+        else:
+            await update.message.reply_text("⚠️ Model list refreshed, but no models were found. Please check endpoint configurations and logs.")
+            logger.warning("Manual model reload resulted in zero models.")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ An error occurred while reloading models: {e}")
+        logger.error(f"Error during manual model reload: {e}", exc_info=True)
+
 
 async def credits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show credits."""
-    await update.message.reply_text("Disruptive Collective, x.com/DisruptiveCLCTV, we own ur soul now")
+    if not update.message: return
+    await update.message.reply_text("Built by the Disruptive Collective. Transparency is key!")
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Return current usage stats."""
-    stat_text = f"Messages processed: {stats['messages_processed']}\nErrors: {stats['errors']}"
+    if not update.message: return
+    # Include model count in stats
+    stat_text = (
+        f"Messages processed: {stats.get('messages_processed', 0)}\n"
+        f"Errors encountered: {stats.get('errors', 0)}\n"
+        f"Currently loaded models: {len(models)}"
+    )
     await update.message.reply_text(stat_text)
 
 async def set_personality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Set a custom personality (system prompt override) for this chat.
-    Usage: /setpersonality <new prompt text>
-    """
+    if not update.message: return
     if not context.args:
-        await update.message.reply_text("Usage: /setpersonality <new prompt>")
+        await update.message.reply_text("Usage: /setpersonality <your custom system prompt text>")
         return
     new_prompt = " ".join(context.args)
-    if "personalities" not in context.bot_data:
-        context.bot_data["personalities"] = {}
-    chat_id = update.effective_chat.id
-    context.bot_data["personalities"][chat_id] = new_prompt
+    context.bot_data.setdefault("personalities", {})[update.effective_chat.id] = new_prompt
     await update.message.reply_text("Personality updated for this chat!")
+    logger.info(f"Custom personality set for chat {update.effective_chat.id}")
+
 
 async def clear_personality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Clear the custom personality for the current chat."""
+    if not update.message: return
     chat_id = update.effective_chat.id
     personalities = context.bot_data.get("personalities", {})
     if chat_id in personalities:
         del personalities[chat_id]
-        await update.message.reply_text("Custom personality cleared. Reverting to default system prompt.")
+        await update.message.reply_text("Custom personality cleared. Reverting to default system prompt for this bot.")
+        logger.info(f"Cleared custom personality for chat {chat_id}")
     else:
         await update.message.reply_text("No custom personality set for this chat.")
 
+async def tts_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message: return
+    # Store TTS preference per chat
+    chat_id = update.effective_chat.id
+    context.bot_data.setdefault("tts_enabled", {})[chat_id] = True
+    await update.message.reply_text("Text-to-speech is now ON for this chat.")
+    logger.info(f"TTS enabled for chat {chat_id}")
+
+
+async def tts_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message: return
+     # Store TTS preference per chat
+    chat_id = update.effective_chat.id
+    context.bot_data.setdefault("tts_enabled", {})[chat_id] = False
+    await update.message.reply_text("Text-to-speech is now OFF for this chat.")
+    logger.info(f"TTS disabled for chat {chat_id}")
+
+
+async def list_voices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message: return
+    if AVAILABLE_VOICES:
+        lines = [f"{i+1}. {voice}" for i, voice in enumerate(AVAILABLE_VOICES)]
+        await update.message.reply_text("Available TTS voices:\n" + "\n".join(lines))
+    else:
+        await update.message.reply_text("No TTS voices are configured in config.ini.")
+
+async def set_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message: return
+    if not context.args:
+        await update.message.reply_text("Usage: /setvoice <voice_number>\nUse /listvoices to see the options.")
+        return
+    if not AVAILABLE_VOICES:
+        await update.message.reply_text("No TTS voices configured. Cannot set voice.")
+        return
+    try:
+        index = int(context.args[0]) - 1
+        if index < 0 or index >= len(AVAILABLE_VOICES):
+            await update.message.reply_text(f"Invalid voice number. Please choose between 1 and {len(AVAILABLE_VOICES)}.")
+            return
+
+        selected_voice = AVAILABLE_VOICES[index]
+        context.bot_data.setdefault("chat_voice", {})[update.effective_chat.id] = selected_voice
+        await update.message.reply_text(f"TTS voice for this chat set to: {selected_voice}")
+        logger.info(f"Chat {update.effective_chat.id} set TTS voice to '{selected_voice}'")
+
+    except (ValueError, IndexError):
+        await update.message.reply_text("Invalid input. Please provide a valid voice number from the /listvoices command.")
+
+
 async def schizo_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Process incoming messages and reply using weighted model selection.
-    Includes conversation history and uses either the chat-specific personality
-    or the bot's default system prompt.
-    """
+    """Main chat handler that processes messages and produces responses using available models."""
     if not update.message or not update.message.text:
-        logger.info("[📩] Received non-text update, skipping response.")
+        logger.debug("[📩] Received non-text or empty update, skipping.")
         return
 
-    stats["messages_processed"] += 1
+    # Increment counters
+    stats["messages_processed"] = stats.get("messages_processed", 0) + 1
+    MESSAGES_PROCESSED.inc()
+
+    # Gather context
     user_message = update.message.text
     chat_id = update.effective_chat.id
     bot_username = context.bot_data.get("bot_username", "").lower()
+
+    # Determine system prompt (chat-specific or bot default)
     personality_overrides = context.bot_data.get("personalities", {})
     system_prompt = personality_overrides.get(chat_id, context.bot_data.get("system_prompt", DEFAULT_SYSTEM_PROMPT))
 
+    # Determine if a reply is needed (mention, reply, or random chance)
     force_reply = False
-    if f"@{bot_username}" in user_message.lower():
+    if bot_username and f"@{bot_username}" in user_message.lower():
         force_reply = True
     if update.message.reply_to_message and update.message.reply_to_message.from_user.username:
-        if update.message.reply_to_message.from_user.username.lower() == bot_username:
+        replied_to_username = update.message.reply_to_message.from_user.username.lower()
+        if bot_username and replied_to_username == bot_username:
             force_reply = True
 
-    if not force_reply and random.random() > REPLY_CHANCE:
+    should_reply = force_reply or (random.random() < REPLY_CHANCE)
+    if not should_reply:
+        logger.debug(f"Skipping reply based on chance ({REPLY_CHANCE}) and context.")
         return
 
-    conv_key = (bot_username, chat_id)
+    # --- Prepare prompt ---
+    conv_key = (bot_username, chat_id) # Use bot username in key for multi-bot setups
     history = conversation_history.get(conv_key, [])
+    # Append current user message to history for context
     history.append(f"User: {user_message}")
-    if len(history) > 5:
-        history = history[-5:]
+    history = history[-5:] # Keep only the last 5 turns (User + Schizo pairs ideally)
     conversation_history[conv_key] = history
-    context_text = "\n".join(history) + "\n"
+    context_text = "\n".join(history) # Context includes the latest user message
 
-    attempts = 0
-    tried_models = set()
+    # Construct the final prompt
+    prompt = f"{system_prompt}\n\n{context_text}\nSchizo:" # Added separator for clarity
+    logger.debug(f"Constructed prompt for chat {chat_id}:\n{prompt}")
 
-    while attempts < MAX_MODEL_RETRIES:
-        available_models = [m for m in models if m["id"] not in tried_models]
-        if not available_models:
-            break
-        model = weighted_model_selection(available_models)
-        tried_models.add(model["id"])
-        dynamic_max_tokens = min(len(user_message) * 2, MAX_TOKENS)
-        prompt = f"{system_prompt}\n{context_text}User: {user_message}\nSchizo:"
-        logger.info(f"[🤡] Attempt {attempts + 1}/{MAX_MODEL_RETRIES}: Using {model['id']} @ {model['endpoint']}")
-        client = MODEL_CLIENT_MAP.get(model["id"])
-        if not client:
-            logger.error(f"[💥] No client found for {model['id']}")
-            attempts += 1
-            continue
+
+    # --- Select Model ---
+    selected_model_info: Optional[Dict[str, str]] = None
+    chat_specific_model_id = context.bot_data.get("chat_model", {}).get(chat_id)
+
+    # 1. Try chat-specific model if set
+    if chat_specific_model_id:
+        # Find the full model info (including endpoint) from the global list
+        found_model = next((m for m in models if m.get("id") == chat_specific_model_id), None)
+        if found_model and found_model.get("id") in MODEL_CLIENT_MAP:
+            selected_model_info = found_model
+            logger.info(f"[🎯] Using chat-specific model '{chat_specific_model_id}' for chat {chat_id}")
+        else:
+            logger.warning(f"[⚠️] Chat {chat_id} requested model '{chat_specific_model_id}' but it's not available or loaded. Falling back to default selection.")
+            # Remove the invalid setting for this chat to prevent repeated failures
+            if chat_id in context.bot_data.get("chat_model", {}):
+                del context.bot_data["chat_model"][chat_id]
+
+
+    # 2. If no specific model or it failed, use weighted random selection
+    if not selected_model_info:
+        if not models: # Check if any models are loaded at all
+             logger.error("[🔥] No models available globally. Cannot generate reply.")
+             await update.message.reply_text("Sorry, no AI models are available right now.")
+             return
+        selected_model_info = weighted_model_selection(models)
+        if selected_model_info:
+             logger.info(f"[🎲] Using weighted random model '{selected_model_info.get('id')}' for chat {chat_id}")
+        else:
+             logger.error("[🔥] Weighted selection failed to return a model. Cannot generate reply.")
+             await update.message.reply_text("Sorry, could not select an AI model to handle your request.")
+             return
+
+
+    # --- Generate Reply using selected model (with retries for weighted selection) ---
+    reply = None
+    model_id = selected_model_info.get("id") # Should always have an ID here
+    client = MODEL_CLIENT_MAP.get(model_id)
+
+    if not client or not model_id:
+         logger.error(f"[💥] Critical error: Client or Model ID missing for selected model: {selected_model_info}")
+         await update.message.reply_text("Internal error: Could not find the client for the selected model.")
+         return
+
+    @MODEL_SELECTION_LATENCY.time() # Time the generation attempt
+    async def attempt_generation(current_model_id, current_client):
+        nonlocal reply # Allow modification of outer scope variable
         try:
-            resp = client.chat.completions.create(
-                model=model["id"],
-                messages=[{"role": "user", "content": prompt}],
+            # Dynamic token calculation (simple example)
+            dynamic_max_tokens = min(max(100, len(user_message) * 2 + len(prompt)//2), MAX_TOKENS) # Rough estimate based on input/prompt len
+            logger.info(f"[💬] Generating reply using '{current_model_id}' (max_tokens: {dynamic_max_tokens})")
+            resp = await asyncio.to_thread( # Run blocking OpenAI call in a separate thread
+                current_client.chat.completions.create,
+                model=current_model_id,
+                messages=[{"role": "system", "content": system_prompt}, # Provide system prompt separately
+                          {"role": "user", "content": context_text + "\nSchizo:"}], # Provide context as user message
                 max_tokens=dynamic_max_tokens,
-                temperature=0.75,
+                temperature=0.75, # Consider making temperature configurable
+                stop=["User:", "\nUser:"] # Stop generation if it starts hallucinating another user turn
             )
-            if not resp.choices or not resp.choices[0].message.content:
-                raise ValueError("No valid response content from model")
-            reply = extract_final_reply(resp.choices[0].message.content)
-            await send_long_message(update, reply)
-            await send_voice_message(update, reply)
-            logger.info(f"[🎭] Schizo’d: {reply[:100]}...")
-            model_weights[model["id"]] += 0.1
-            history.append(f"Schizo: {reply}")
-            conversation_history[conv_key] = history[-5:]
-            return
+
+            if not resp.choices or not resp.choices[0].message or not resp.choices[0].message.content:
+                raise ValueError(f"No valid response content received from model '{current_model_id}'")
+
+            generated_text = resp.choices[0].message.content
+            reply = extract_final_reply(generated_text) # Clean the reply
+            logger.info(f"[✅] Successfully generated reply from '{current_model_id}'. Preview: {reply[:100]}...")
+            # Adjust weight on success
+            if current_model_id in model_weights:
+                model_weights[current_model_id] = min(model_weights[current_model_id] + 0.1, 5.0) # Increase weight, cap at 5.0
+            return True # Indicate success
         except Exception as e:
-            logger.error(f"[💥] Error with {model['id']} @ {model['endpoint']}: {e}")
-            stats["errors"] += 1
-            attempts += 1
-            model_weights[model["id"]] = max(model_weights[model["id"]] - 0.2, 0.1)
+            logger.error(f"[💥] Error during generation with '{current_model_id}': {e}", exc_info=False) # exc_info=False for less noise unless debugging
+            ERROR_COUNTER.inc()
+            stats["errors"] = stats.get("errors", 0) + 1
+            # Adjust weight on failure
+            if current_model_id in model_weights:
+                 model_weights[current_model_id] = max(model_weights[current_model_id] - 0.2, 0.1) # Decrease weight, floor at 0.1
+            return False # Indicate failure
 
-    logger.warning(f"[❌] Exhausted {MAX_MODEL_RETRIES} retries for message: '{user_message[:50]}...'")
-    await update.message.reply_text("Ricky is retarded rn, try later", reply_to_message_id=update.message.message_id)
 
-# Function to register all bot commands
-async def register_bot_commands(bot_app):
-    bot_app.add_handlers([
+    # --- Execute generation ---
+    success = await attempt_generation(model_id, client)
+
+    # --- Retry logic ONLY if using weighted selection (not for chat-specific choice) ---
+    if not success and not chat_specific_model_id:
+        logger.warning(f"[🔄] Initial attempt with '{model_id}' failed. Trying fallbacks...")
+        attempts = 1 # Already had one attempt
+        tried_models = {model_id} # Keep track of failed models
+        backoff = RETRY_DELAY # Use configured delay
+
+        while attempts < MAX_MODEL_RETRIES:
+            available_fallback_models = [m for m in models if m.get("id") not in tried_models]
+            if not available_fallback_models:
+                logger.warning("[❌] No more fallback models available.")
+                break
+
+            fallback_model_info = weighted_model_selection(available_fallback_models)
+            if not fallback_model_info:
+                 logger.warning("[❌] Could not select a fallback model.")
+                 break # Should not happen if available_fallback_models is not empty, but safety check
+
+            fallback_model_id = fallback_model_info.get("id")
+            fallback_client = MODEL_CLIENT_MAP.get(fallback_model_id)
+            tried_models.add(fallback_model_id)
+
+            if not fallback_client or not fallback_model_id:
+                 logger.error(f"[💥] Fallback model '{fallback_model_id}' missing client or ID. Skipping.")
+                 attempts +=1
+                 continue
+
+            logger.info(f"[🔄] Retrying (Attempt {attempts + 1}/{MAX_MODEL_RETRIES}) with fallback '{fallback_model_id}' after {backoff:.1f}s delay...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60) # Exponential backoff up to 60 seconds
+
+            success = await attempt_generation(fallback_model_id, fallback_client)
+            if success:
+                logger.info(f"[✅] Successfully generated reply using fallback '{fallback_model_id}'.")
+                break # Exit retry loop on success
+            else:
+                 attempts += 1 # Increment attempts only on failure
+
+        if not success:
+             logger.error(f"[❌] Exhausted all {MAX_MODEL_RETRIES} retries for message in chat {chat_id}.")
+
+
+    # --- Send Reply ---
+    if reply:
+        await send_long_message(update, reply)
+        # Add successful reply to history
+        history.append(f"Schizo: {reply}")
+        conversation_history[conv_key] = history[-5:] # Keep history updated
+
+        # Send TTS if enabled for this chat
+        # Default to True if not explicitly set for the chat
+        tts_enabled_for_chat = context.bot_data.get("tts_enabled", {}).get(chat_id, True)
+        if tts_enabled_for_chat:
+            # Run TTS in background to avoid blocking message sending
+            asyncio.create_task(send_voice_message(update, context, reply))
+    elif update.message: # Check if update.message still exists
+        # If no reply generated after all attempts
+        await update.message.reply_text("Sorry, I couldn't come up with a reply this time.",
+                                          reply_to_message_id=update.message.message_id)
+
+
+def register_bot_commands(bot_app: Application) -> None:
+    """Register all Telegram command handlers."""
+    # Use a dictionary for easier management if handlers grow
+    handlers = [
         CommandHandler("start", start),
         CommandHandler("help", help_cmd),
         CommandHandler("models", list_models),
+        CommandHandler("setmodel", set_model),
+        CommandHandler("unsetmodel", unset_model), # New handler
+        CommandHandler("reload_models", reload_models_cmd), # New handler
         CommandHandler("credits", credits),
         CommandHandler("stats", stats_cmd),
         CommandHandler("setpersonality", set_personality),
         CommandHandler("clearpersonality", clear_personality),
+        CommandHandler("tts_on", tts_on),
+        CommandHandler("tts_off", tts_off),
+        CommandHandler("listvoices", list_voices),
+        CommandHandler("setvoice", set_voice),
+        # Message handler for general chat (must be last)
         MessageHandler(filters.TEXT & (~filters.COMMAND), schizo_reply),
-    ])
+    ]
+    bot_app.add_handlers(handlers)
 
-# Function to start an individual Telegram bot instance
+
 async def start_telegram_bot_instance(token: str, system_prompt: str, bot_username: str) -> None:
-    """Start a Telegram bot instance with its own token, system prompt, and username."""
+    """
+    Start a single Telegram bot instance and continuously poll for updates.
+    Includes exponential backoff for resilient polling.
+    """
+    # Configure persistence if desired (e.g., PicklePersistence)
+    # persistence = PicklePersistence(filepath=f"./persist/{bot_username}_persist")
+    # bot_app = Application.builder().token(token).persistence(persistence).build()
     bot_app = Application.builder().token(token).build()
+
+    # Initialize bot_data correctly for each instance
     bot_app.bot_data["system_prompt"] = system_prompt
     bot_app.bot_data["bot_username"] = bot_username
-    bot_app.bot_data["personalities"] = {}
+    bot_app.bot_data["personalities"] = {} # Chat-specific personalities
+    bot_app.bot_data["tts_enabled"] = {}   # Per-chat TTS toggle, default is True (handled in schizo_reply)
+    bot_app.bot_data["chat_model"] = {}    # Per-chat model selection
+    bot_app.bot_data["chat_voice"] = {}    # Per-chat voice selection
 
-    await register_bot_commands(bot_app)
+    register_bot_commands(bot_app)
+    logger.info(f"Starting Telegram bot instance for @{bot_username} (token ending in ...{token[-5:]})")
 
-    logger.info(f"Starting Telegram bot for @{bot_username} (token ending in {token[-5:]})...")
     await bot_app.initialize()
     await bot_app.start()
+    logger.info(f"Bot @{bot_username} initialized and started.")
 
+
+    # Resilient polling loop
     attempt = 0
-    base_delay = RETRY_DELAY
-    max_delay = 60
+    base_delay = 5 # Start with a shorter delay
+    max_delay = 120 # Increase max delay
+
     while True:
         try:
-            await bot_app.updater.start_polling(timeout=15, drop_pending_updates=True)
-            attempt = 0
+            logger.info(f"Starting polling for @{bot_username}...")
+            await bot_app.updater.start_polling(
+                timeout=30, # Longer timeout
+                drop_pending_updates=True, # Drop updates from while bot was down
+                allowed_updates=Update.ALL_TYPES # Process all update types
+            )
+            logger.info(f"Polling started successfully for @{bot_username}.")
+            # Keep the task running indefinitely until an error occurs
             await asyncio.Future()
+        except asyncio.CancelledError:
+             logger.info(f"Polling cancelled for bot @{bot_username}. Stopping.")
+             await bot_app.updater.stop()
+             await bot_app.stop()
+             await bot_app.shutdown()
+             logger.info(f"Bot @{bot_username} shut down gracefully.")
+             break # Exit the loop
         except Exception as e:
             attempt += 1
-            delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
-            logger.error(f"Polling error for bot @{bot_username} (attempt {attempt}): {e}. Retrying in {delay} seconds...")
+            # Calculate delay with jitter
+            delay = min(base_delay * (2 ** attempt), max_delay) + random.uniform(0, base_delay)
+            delay = min(delay, max_delay) # Ensure jitter doesn't exceed max_delay
+            logger.error(f"Polling error for bot @{bot_username} (Attempt {attempt}): {e}. Retrying in {delay:.2f} seconds...", exc_info=True)
             await asyncio.sleep(delay)
+            # Reset attempt count after a successful connection? Maybe not, keep increasing backoff on repeated failures.
 
-# FastAPI Server Setup
-app = FastAPI()
 
-@app.get("/")
-async def index() -> Dict[str, str]:
-    """Root endpoint returning a simple message."""
-    return {"message": "SchitzoChat V1: Telegram bot + schizo web, hit /models for brainz"}
+# ----------------------
+# FastAPI Server & Endpoints
+# ----------------------
+# Note: Consider moving FastAPI app to a separate file for larger projects
+fastapi_app = FastAPI(
+    title="TISM v4 Monitor",
+    description="API for monitoring and controlling the TISM Telegram bot framework.",
+    version="4.0.0"
+)
 
-@app.get("/models")
-async def get_models() -> List[Dict[str, str]]:
-    """Endpoint listing available models."""
-    return [{"id": m["id"], "endpoint": m["endpoint"]} for m in models]
+@fastapi_app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Middleware to log each HTTP request to the FastAPI server."""
+    logger.info(f"[API] Incoming request: {request.method} {request.url.path}")
+    try:
+        response = await call_next(request)
+        logger.info(f"[API] Response status: {response.status_code}")
+        return response
+    except Exception as e:
+        logger.error(f"[API] Error handling request {request.method} {request.url.path}: {e}", exc_info=True)
+        return Response("Internal Server Error", status_code=500)
 
-@app.get("/stats")
-async def get_stats() -> Dict[str, int]:
-    """Endpoint returning current usage stats."""
-    return stats
 
-@app.post("/reload_config")
-async def reload_config() -> Dict[str, str]:
-    """Hot-reload config settings from config.ini (only non-bot settings)."""
-    config.read("config.ini")
-    global DEFAULT_SYSTEM_PROMPT, REPLY_CHANCE, MAX_TOKENS, MAX_MODEL_RETRIES, RETRY_DELAY
-    DEFAULT_SYSTEM_PROMPT = clean_config_value(config.get("settings", "system_prompt", fallback=""))
-    REPLY_CHANCE = float(clean_config_value(config.get("settings", "reply_chance", fallback="0.1")))
-    MAX_TOKENS = int(clean_config_value(config.get("settings", "max_tokens", fallback="200")))
-    MAX_MODEL_RETRIES = int(clean_config_value(config.get("settings", "max_model_retries", fallback="3")))
-    RETRY_DELAY = float(clean_config_value(config.get("settings", "retry_delay", fallback="10")))
-    return {"message": "Config reloaded successfully."}
+@fastapi_app.get("/")
+async def index() -> Dict[str, Any]:
+    """Basic info endpoint about the running TISM instance."""
+    return {
+        "message": "TISM V4: Telegram bot framework running.",
+        "loaded_models": len(models),
+        "configured_bots": len(BOT_TOKENS),
+        "endpoints": {
+            "/models": "List currently loaded models",
+            "/stats": "Get basic usage statistics",
+            "/reload_config": "Reload non-critical settings from config.ini (POST)",
+            "/metrics": "Prometheus metrics endpoint"
+        }
+     }
 
-# Combined Startup: Run multiple Telegram bots and the FastAPI server concurrently.
+@fastapi_app.get("/models")
+async def get_models() -> List[Dict[str, Any]]:
+    """Return a detailed list of registered models and their weights."""
+    return [
+        {
+            "id": m.get("id"),
+            "endpoint": m.get("endpoint"),
+            "current_weight": model_weights.get(m.get("id"), "N/A") # Show current weight
+         } for m in models
+     ]
+
+@fastapi_app.get("/stats")
+async def get_stats() -> Dict[str, Any]:
+    """Return usage statistics including model weights."""
+    return {
+        "messages_processed": stats.get("messages_processed", 0),
+        "errors": stats.get("errors", 0),
+        "model_weights": model_weights # Include weights in stats
+    }
+
+@fastapi_app.post("/reload_config")
+async def reload_config_endpoint() -> Dict[str, str]:
+    """
+    Reload non-critical configuration values from config.ini.
+    Note: Does not reload tokens, endpoints, or bot structure.
+    """
+    global DEFAULT_SYSTEM_PROMPT, REPLY_CHANCE, MAX_TOKENS, MAX_MODEL_RETRIES, RETRY_DELAY, BLACKLISTED_MODELS, TTS_API_KEY, TTS_ENDPOINT, TTS_MODEL, TTS_VOICE, TTS_SPEED, AVAILABLE_VOICES
+    logger.info("[API] Received request to reload configuration...")
+    try:
+        new_config = load_config()
+
+        # Reload settings section
+        DEFAULT_SYSTEM_PROMPT = clean_config_value(new_config.get("settings", "system_prompt", fallback=DEFAULT_SYSTEM_PROMPT))
+        REPLY_CHANCE = float(clean_config_value(new_config.get("settings", "reply_chance", fallback=str(REPLY_CHANCE))))
+        MAX_TOKENS = int(clean_config_value(new_config.get("settings", "max_tokens", fallback=str(MAX_TOKENS))))
+        MAX_MODEL_RETRIES = int(clean_config_value(new_config.get("settings", "max_model_retries", fallback=str(MAX_MODEL_RETRIES))))
+        RETRY_DELAY = float(clean_config_value(new_config.get("settings", "retry_delay", fallback=str(RETRY_DELAY))))
+        BLACKLISTED_MODELS = set(
+            m.strip() for m in clean_config_value(new_config.get("settings", "blacklist_models", fallback=",".join(BLACKLISTED_MODELS))).split(",") if m.strip()
+        )
+
+         # Reload TTS section
+        TTS_API_KEY = clean_config_value(new_config.get("tts", "api_key", fallback=TTS_API_KEY))
+        TTS_ENDPOINT = clean_config_value(new_config.get("tts", "endpoint", fallback=TTS_ENDPOINT))
+        TTS_MODEL = clean_config_value(new_config.get("tts", "model", fallback=TTS_MODEL))
+        TTS_VOICE = clean_config_value(new_config.get("tts", "voice", fallback=TTS_VOICE)) # Default voice if not set per chat
+        TTS_SPEED = float(clean_config_value(new_config.get("tts", "speed", fallback=str(TTS_SPEED))))
+        AVAILABLE_VOICES = [v.strip() for v in new_config.get("tts", "available_voices", fallback=",".join(AVAILABLE_VOICES)).split(",") if v.strip()]
+
+        logger.info("[API] Configuration reloaded successfully.")
+        return {"message": "Config reloaded successfully."}
+    except Exception as e:
+        logger.error(f"[API] Failed to reload configuration: {e}", exc_info=True)
+        # Return 500 status code might be better here using Response object
+        return {"message": f"Error reloading config: {e}"}
+
+
+@fastapi_app.get("/metrics")
+async def metrics() -> Response:
+    """Expose Prometheus metrics."""
+    data = generate_latest()
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+
+# ----------------------
+# Combined Startup: Run Telegram bots and the FastAPI server concurrently.
+# ----------------------
 async def main() -> None:
+    """Initialize and run all bot instances and the FastAPI server."""
+    # Create tasks for each bot instance
     telegram_tasks = [
-        start_telegram_bot_instance(token, prompt, username)
+        asyncio.create_task(start_telegram_bot_instance(token, prompt, username))
         for token, prompt, username in zip(BOT_TOKENS, SYSTEM_PROMPTS, BOT_USERNAMES)
     ]
-    server = uvicorn.Server(uvicorn.Config(app=app, host="0.0.0.0", port=8007, loop="asyncio", log_level="info"))
-    await asyncio.gather(server.serve(), *telegram_tasks)
+
+    # Configure and create the Uvicorn server task
+    uvicorn_config = uvicorn.Config(app=fastapi_app, host="0.0.0.0", port=8007, loop="asyncio", log_level="info")
+    server = uvicorn.Server(config=uvicorn_config)
+    server_task = asyncio.create_task(server.serve())
+
+    # Run all tasks concurrently
+    # If one task crashes, others will continue until manually stopped or they also crash.
+    # Consider more robust supervision for production environments.
+    logger.info("Starting FastAPI server and Telegram bot instances...")
+    done, pending = await asyncio.wait(
+        telegram_tasks + [server_task],
+        return_when=asyncio.FIRST_COMPLETED, # Or FIRST_EXCEPTION
+    )
+
+    # Handle completed/failed tasks (optional: logging or cleanup)
+    for task in done:
+        try:
+            await task # Await completed tasks to raise exceptions if they failed
+            logger.info(f"Task {task.get_name()} completed normally.")
+        except Exception as e:
+            logger.error(f"Task {task.get_name()} failed: {e}", exc_info=True)
+
+    # Cancel pending tasks if one has finished/failed (optional: graceful shutdown)
+    logger.info("One task finished or failed, cancelling pending tasks...")
+    for task in pending:
+        task.cancel()
+        try:
+            await task # Allow cancellation to propagate
+        except asyncio.CancelledError:
+            logger.info(f"Task {task.get_name()} cancelled successfully.")
+        except Exception as e:
+             logger.error(f"Error during cancellation of task {task.get_name()}: {e}", exc_info=True)
+
+    logger.info("Application shutdown.")
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested via KeyboardInterrupt.")
+    except Exception as e:
+         logger.critical(f"Unhandled exception in main execution: {e}", exc_info=True)
